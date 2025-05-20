@@ -131,15 +131,30 @@ def save_selected_and_ranking(chat_id: int, ids: list[int]) -> None:
 def load_games_from_excel(path: str) -> pd.DataFrame:
     """
     Liest die Excel-Datei ein und gibt einen DataFrame mit Spalten:
-    [game_id, game_name, price]. Spiel-IDs sind fortlaufend ab 1.
+    [game_id, game_name, price].
+    Die IDs werden aus der Excel-Datei übernommen.
     """
-    df_raw = pd.read_excel(path, header=None)
-    df_clean = df_raw.dropna(subset=[1]).loc[:, [1, 2]].copy()
-    df_clean.columns = ["game_name", "price"]
-    df_clean.insert(0, "game_id", range(1, len(df_clean) + 1))
-    df_clean["game_name"] = df_clean["game_name"].astype(str)
-    df_clean["price"] = df_clean["price"].astype(float)
-    return df_clean
+    df = pd.read_excel(path)  # verwendet automatisch die erste Zeile als Header
+
+    # Überprüfen, ob die erwarteten Spalten vorhanden sind
+    expected_columns = {"ID", "Spiel", "Preis in €"}
+    if not expected_columns.issubset(df.columns):
+        raise ValueError(f"Excel-Datei muss die Spalten {expected_columns} enthalten.")
+
+    # Umbenennen zur internen Einheitlichkeit (optional, aber sinnvoll)
+    df = df.rename(columns={
+        "ID": "game_id",
+        "Spiel": "game_name",
+        "Preis in €": "price"
+    })
+
+    # Datentypen absichern
+    df["game_id"] = df["game_id"].astype(int)
+    df["game_name"] = df["game_name"].astype(str)
+    df["price"] = df["price"].astype(float)
+
+    return df
+
 
 # Excel-Datei beim Start laden (Pfad anpassen, falls nötig)
 GAMES_DF = load_games_from_excel("SpieleMitPreisenIDs.xlsx")
