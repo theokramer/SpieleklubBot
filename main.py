@@ -1,9 +1,12 @@
-# main.py
 import os
 import logging
 import re
 
-from telegram import Update
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -11,9 +14,8 @@ from telegram.ext import (
     MessageHandler,
     ContextTypes,
     filters,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
 )
+
 
 # ── LOGGING ──────────────────────────────────────────────────────────────────────
 logging.basicConfig(
