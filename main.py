@@ -41,18 +41,24 @@ def get_db_connection():
 def init_db() -> None:
     """
     Legt in Postgres die Tabelle user_state an, falls sie noch nicht existiert:
-      - chat_id  BIGINT PRIMARY KEY
-      - selected TEXT       (JSON-Array)
-      - ranking  TEXT       (JSON-Array)
+      - chat_id    BIGINT PRIMARY KEY
+      - first_name TEXT
+      - last_name  TEXT
+      - username   TEXT
+      - selected   TEXT    (JSON-Array)
+      - ranking    TEXT    (JSON-Array)
     """
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute(
         """
         CREATE TABLE IF NOT EXISTS user_state (
-            chat_id  BIGINT PRIMARY KEY,
-            selected TEXT,
-            ranking  TEXT
+            chat_id    BIGINT PRIMARY KEY,
+            first_name TEXT,
+            last_name  TEXT,
+            username   TEXT,
+            selected   TEXT,
+            ranking    TEXT
         );
         """
     )
@@ -60,10 +66,33 @@ def init_db() -> None:
     conn.close()
     logger.info("Postgres-Tabelle user_state ist nun vorhanden.")
 
+def save_profile(chat_id: int, first_name: str, last_name: str, username: str) -> None:
+    """
+    Speichert oder aktualisiert in Postgres die Spalten 'first_name', 'last_name' und 'username' für diesen chat_id.
+    Falls der Datensatz noch nicht existiert, wird er angelegt (selected und ranking bleiben NULL).
+    """
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        INSERT INTO user_state (chat_id, first_name, last_name, username, selected, ranking)
+        VALUES (%s, %s, %s, %s, NULL, NULL)
+        ON CONFLICT (chat_id) DO UPDATE
+          SET first_name = EXCLUDED.first_name,
+              last_name  = EXCLUDED.last_name,
+              username   = EXCLUDED.username
+        """,
+        (chat_id, first_name, last_name, username),
+    )
+    conn.commit()
+    conn.close()
+    logger.info(f"[DB] Gespeichert (Profil) für chat_id={chat_id}: "
+                f"{first_name} {last_name}, @{username}")
+
 def save_selected(chat_id: int, selected_games: list[str]) -> None:
     """
     Speichert oder aktualisiert in Postgres die Spalte 'selected' für diesen chat_id.
-    (ranking bleibt unverändert, falls schon vorhanden.)
+    (ranking bleibt unverändert, falls schon vorhanden; Profil-Daten bleiben erhalten.)
     """
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -71,8 +100,8 @@ def save_selected(chat_id: int, selected_games: list[str]) -> None:
 
     cursor.execute(
         """
-        INSERT INTO user_state (chat_id, selected, ranking)
-        VALUES (%s, %s, NULL)
+        INSERT INTO user_state (chat_id, first_name, last_name, username, selected, ranking)
+        VALUES (%s, NULL, NULL, NULL, %s, NULL)
         ON CONFLICT (chat_id) DO UPDATE
           SET selected = EXCLUDED.selected
         """,
@@ -86,7 +115,7 @@ def save_selected(chat_id: int, selected_games: list[str]) -> None:
 def save_ranking(chat_id: int, ranking: list[str]) -> None:
     """
     Speichert oder aktualisiert in Postgres die Spalte 'ranking' für diesen chat_id.
-    (selected bleibt unverändert, falls schon existiert.)
+    (selected bleibt unverändert, falls schon existiert; Profil-Daten bleiben erhalten.)
     """
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -94,8 +123,8 @@ def save_ranking(chat_id: int, ranking: list[str]) -> None:
 
     cursor.execute(
         """
-        INSERT INTO user_state (chat_id, selected, ranking)
-        VALUES (%s, NULL, %s)
+        INSERT INTO user_state (chat_id, first_name, last_name, username, selected, ranking)
+        VALUES (%s, NULL, NULL, NULL, NULL, %s)
         ON CONFLICT (chat_id) DO UPDATE
           SET ranking = EXCLUDED.ranking
         """,
@@ -125,22 +154,34 @@ def build_multi_select_keyboard(selected_games: list[str]) -> InlineKeyboardMark
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    /start: Reset in-memory state und lege in DB einen neuen Datensatz an (selected=[]).
+    /start: Reset in-memory state, speichere Profil, lege in DB einen neuen Datensatz an (selected=[]).
     """
+    user = update.effective_user
     chat_id = update.effective_chat.id
+
+    # Profil-Daten aus Telegram holen
+    first_name = user.first_name or ""
+    last_name = user.last_name or ""
+    username = user.username or ""
+
     # In-memory state zurücksetzen:
     context.user_data.clear()
     context.user_data["selected_games"] = []
     context.user_data["awaiting_ranking"] = False
     context.user_data["ranking"] = []
 
-    # DB: Leeren Datensatz für selected anlegen (ranking bleibt NULL)
-    save_selected(chat_id, [])
+    # DB: Profil speichern (erstellt neuen Eintrag, falls noch nicht vorhanden)
+    save_profile(chat_id, first_name, last_name, username)
+    save_selected(chat_id, [])  # initiale leere Auswahl
 
     await context.bot.send_message(
         chat_id=chat_id,
         text=(
             "👋 Willkommen beim Multi-Game Picker Bot!\n\n"
+            "Ich habe deine Profildaten gespeichert:\n"
+            f"Vorname: {first_name}\n"
+            f"Nachname: {last_name}\n"
+            f"Telegram-Handle: @{username}\n\n"
             "Bitte wähle per Klick die Spiele aus, die du möchtest. "
             "Tippe erneut auf ein Spiel, um es zu de-selektieren. "
             "Wenn du fertig bist, drücke ‚Done‘."
@@ -290,7 +331,7 @@ async def change(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def current(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    /current: Zeigt den aktuellen memory-Zustand (selected + ranking) an.
+    /current: Zeigt den aktuellen in-memory-Zustand (selected + ranking) an.
     """
     chat_id = update.effective_chat.id
     selected_games = context.user_data.get("selected_games", [])
