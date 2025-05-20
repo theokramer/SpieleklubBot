@@ -1,19 +1,16 @@
 import os
 import logging
-import re
 import json
 import psycopg2
 import psycopg2.extras
+import pandas as pd
 
 from telegram import (
     Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
 )
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
-    CallbackQueryHandler,
     MessageHandler,
     ContextTypes,
     filters,
@@ -40,36 +37,52 @@ def get_db_connection():
 
 def init_db() -> None:
     """
-    Legt in Postgres die Tabelle user_state an, falls sie noch nicht existiert:
+    Legt in Postgres die Tabelle user_state an, falls sie noch nicht existiert.
+    Fügt anschließend fehlende Spalten hinzu, falls die Struktur
+    älteren Versionen entspricht.
+    Spalten:
       - chat_id    BIGINT PRIMARY KEY
       - first_name TEXT
       - last_name  TEXT
       - username   TEXT
-      - selected   TEXT    (JSON-Array)
-      - ranking    TEXT    (JSON-Array)
+      - selected   TEXT    (JSON-Array von game_ids)
+      - ranking    TEXT    (JSON-Array von game_ids)
     """
     conn = get_db_connection()
     cursor = conn.cursor()
+
+    # 1. Tabelle anlegen, falls sie nicht existiert, mit allen Spalten
     cursor.execute(
         """
         CREATE TABLE IF NOT EXISTS user_state (
-            chat_id    BIGINT PRIMARY KEY,
-            first_name TEXT,
-            last_name  TEXT,
-            username   TEXT,
-            selected   TEXT,
-            ranking    TEXT
+            chat_id    BIGINT PRIMARY KEY
+          , first_name TEXT
+          , last_name  TEXT
+          , username   TEXT
+          , selected   TEXT
+          , ranking    TEXT
         );
         """
     )
+
+    # 2. Spalten ergänzen, falls sie in älterer Struktur fehlen
+    alter_statements = [
+        "ALTER TABLE user_state ADD COLUMN IF NOT EXISTS first_name TEXT;",
+        "ALTER TABLE user_state ADD COLUMN IF NOT EXISTS last_name TEXT;",
+        "ALTER TABLE user_state ADD COLUMN IF NOT EXISTS username TEXT;",
+        "ALTER TABLE user_state ADD COLUMN IF NOT EXISTS selected TEXT;",
+        "ALTER TABLE user_state ADD COLUMN IF NOT EXISTS ranking TEXT;"
+    ]
+    for stmt in alter_statements:
+        cursor.execute(stmt)
+
     conn.commit()
     conn.close()
-    logger.info("Postgres-Tabelle user_state ist nun vorhanden.")
+    logger.info("Postgres-Tabelle user_state ist eingerichtet (inkl. aller Spalten).")
 
 def save_profile(chat_id: int, first_name: str, last_name: str, username: str) -> None:
     """
-    Speichert oder aktualisiert in Postgres die Spalten 'first_name', 'last_name' und 'username' für diesen chat_id.
-    Falls der Datensatz noch nicht existiert, wird er angelegt (selected und ranking bleiben NULL).
+    Speichert oder aktualisiert Profil-Daten in Postgres.
     """
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -86,283 +99,211 @@ def save_profile(chat_id: int, first_name: str, last_name: str, username: str) -
     )
     conn.commit()
     conn.close()
-    logger.info(f"[DB] Gespeichert (Profil) für chat_id={chat_id}: "
-                f"{first_name} {last_name}, @{username}")
+    logger.info(f"[DB] Profil gespeichert: chat_id={chat_id}, {first_name} {last_name}, @{username}")
 
-def save_selected(chat_id: int, selected_games: list[str]) -> None:
+def save_selected_and_ranking(chat_id: int, ids: list[int]) -> None:
     """
-    Speichert oder aktualisiert in Postgres die Spalte 'selected' für diesen chat_id.
-    (ranking bleibt unverändert, falls schon vorhanden; Profil-Daten bleiben erhalten.)
+    Speichert oder aktualisiert in Postgres die Spalten 'selected' und 'ranking' 
+    für diesen chat_id. Beides ist identisch, da die vom Nutzer gesendete Reihenfolge 
+    zugleich die Rangfolge ist.
     """
     conn = get_db_connection()
     cursor = conn.cursor()
-    json_selected = json.dumps(selected_games, ensure_ascii=False)
+    json_ids = json.dumps(ids, ensure_ascii=False)
 
     cursor.execute(
         """
         INSERT INTO user_state (chat_id, first_name, last_name, username, selected, ranking)
-        VALUES (%s, NULL, NULL, NULL, %s, NULL)
+        VALUES (%s, NULL, NULL, NULL, %s, %s)
         ON CONFLICT (chat_id) DO UPDATE
-          SET selected = EXCLUDED.selected
+          SET selected = EXCLUDED.selected,
+              ranking  = EXCLUDED.ranking
         """,
-        (chat_id, json_selected),
+        (chat_id, json_ids, json_ids),
     )
-
     conn.commit()
     conn.close()
-    logger.info(f"[DB] Gespeichert (selected) für chat_id={chat_id}: {selected_games}")
+    logger.info(f"[DB] Ausgewählte IDs und Ranking gespeichert für chat_id={chat_id}: {ids}")
 
-def save_ranking(chat_id: int, ranking: list[str]) -> None:
-    """
-    Speichert oder aktualisiert in Postgres die Spalte 'ranking' für diesen chat_id.
-    (selected bleibt unverändert, falls schon existiert; Profil-Daten bleiben erhalten.)
-    """
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    json_ranking = json.dumps(ranking, ensure_ascii=False)
 
-    cursor.execute(
-        """
-        INSERT INTO user_state (chat_id, first_name, last_name, username, selected, ranking)
-        VALUES (%s, NULL, NULL, NULL, NULL, %s)
-        ON CONFLICT (chat_id) DO UPDATE
-          SET ranking = EXCLUDED.ranking
-        """,
-        (chat_id, json_ranking),
+# ── EXCEL EINLESEN UND BEREINIGEN ────────────────────────────────────────────────
+
+def load_games_from_excel(path: str) -> pd.DataFrame:
+    """
+    Liest die Excel-Datei ein und gibt einen DataFrame mit Spalten:
+    [game_id, game_name, price]. Spiel-IDs sind fortlaufend ab 1.
+    """
+    df_raw = pd.read_excel(path, header=None)
+    df_clean = df_raw.dropna(subset=[1]).loc[:, [1, 2]].copy()
+    df_clean.columns = ["game_name", "price"]
+    df_clean.insert(0, "game_id", range(1, len(df_clean) + 1))
+    df_clean["game_name"] = df_clean["game_name"].astype(str)
+    df_clean["price"] = df_clean["price"].astype(float)
+    return df_clean
+
+# Excel-Datei beim Start laden (Pfad anpassen, falls nötig)
+GAMES_DF = load_games_from_excel("SpieleMitPreisen.xlsx")
+NUM_PER_PAGE = 10  # Anzahl Spiele pro Seite, kann angepasst werden
+MAX_PAGE = (len(GAMES_DF) - 1) // NUM_PER_PAGE + 1  # Gesamtzahl der Seiten
+
+# ── HILFSFUNKTION: SPIELELISTE ALS TEXT ──────────────────────────────────────────
+
+def format_games_page(page_num: int) -> str:
+    """
+    Gibt einen Textblock zurück mit den Spielen und Preisen
+    für die angegebene Seite (1-basiert).
+    """
+    start_idx = (page_num - 1) * NUM_PER_PAGE
+    end_idx = start_idx + NUM_PER_PAGE
+    slice_df = GAMES_DF.iloc[start_idx:end_idx]
+
+    lines = [f"Seite {page_num}/{MAX_PAGE}:\n"]
+    for _, row in slice_df.iterrows():
+        gid = int(row["game_id"])
+        name = row["game_name"]
+        price = float(row["price"])
+        lines.append(f"{gid}. {name} — {price:.2f}€")
+    lines.append(
+        "\n"
+        "Sende eine Kommaseparierte Liste von IDs in der Reihenfolge, in der du die Spiele bevorzugst.\n"
+        "Beispiel: `1,5,10` (ID 1 ist dein Top-Priorität, dann ID 5, dann ID 10)."
     )
-
-    conn.commit()
-    conn.close()
-    logger.info(f"[DB] Gespeichert (ranking) für chat_id={chat_id}: {ranking}")
-
-
-# ── KONSTANTEN & HILFSFUNKTIONEN ─────────────────────────────────────────────────
-
-# Liste möglicher Spiele
-GAMES = ["Chess", "Tic-Tac-Toe", "Hangman", "2048", "Sudoku"]
-
-def build_multi_select_keyboard(selected_games: list[str]) -> InlineKeyboardMarkup:
-    buttons = []
-    for game in GAMES:
-        label = f"✅ {game}" if game in selected_games else game
-        buttons.append([InlineKeyboardButton(label, callback_data=game)])
-    buttons.append([InlineKeyboardButton("✅ Done", callback_data="__DONE__")])
-    return InlineKeyboardMarkup(buttons)
+    return "\n".join(lines)
 
 
 # ── HANDLER ──────────────────────────────────────────────────────────────────────
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    /start: Reset in-memory state, speichere Profil, lege in DB einen neuen Datensatz an (selected=[]).
+    /start: Profil speichern, initiale Erinnerung senden.
     """
     user = update.effective_user
     chat_id = update.effective_chat.id
 
-    # Profil-Daten aus Telegram holen
     first_name = user.first_name or ""
     last_name = user.last_name or ""
     username = user.username or ""
 
-    # In-memory state zurücksetzen:
+    # In-memory initialisieren
     context.user_data.clear()
-    context.user_data["selected_games"] = []
-    context.user_data["awaiting_ranking"] = False
-    context.user_data["ranking"] = []
 
-    # DB: Profil speichern (erstellt neuen Eintrag, falls noch nicht vorhanden)
+    # Profil in DB speichern
     save_profile(chat_id, first_name, last_name, username)
-    save_selected(chat_id, [])  # initiale leere Auswahl
 
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text=(
-            "👋 Willkommen beim Multi-Game Picker Bot!\n\n"
-            "Ich habe deine Profildaten gespeichert:\n"
-            f"Vorname: {first_name}\n"
-            f"Nachname: {last_name}\n"
-            f"Telegram-Handle: @{username}\n\n"
-            "Bitte wähle per Klick die Spiele aus, die du möchtest. "
-            "Tippe erneut auf ein Spiel, um es zu de-selektieren. "
-            "Wenn du fertig bist, drücke ‚Done‘."
-        ),
+    text = (
+        f"👋 Willkommen, {first_name}!\n\n"
+        "Ich habe dein Profil gespeichert.\n"
+        "Um die Liste der Spiele anzusehen, nutze:\n"
+        "`/games <Seitenzahl>`\n"
+        "Beispiel: `/games 1` zeigt die ersten 10 Spiele.\n"
+        "Sende eine Kommaseparierte Liste von IDs, um direkt die Reihenfolge anzugeben.\n"
+        "Beispiel: `1,5,10` – ID 1 ist dein Favorit, dann ID 5, dann ID 10."
     )
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text="Wähle deine Spiele aus:",
-        reply_markup=build_multi_select_keyboard(context.user_data["selected_games"]),
-    )
+    await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
 
 
-async def handle_selection_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def list_games(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Inline-Button getappt: Toggle ein Spiel und speichere selected in Postgres.
-    Wenn Done getappt, Übergang in Ranking-Modus.
+    /games <Seitenzahl>: Zeigt die entsprechende Seite mit Spielen+Preisen.
     """
-    query = update.callback_query
-    await query.answer()
-    chat_id = query.message.chat.id
-    data = query.data
-    selected_games: list[str] = context.user_data.get("selected_games", [])
+    chat_id = update.effective_chat.id
+    args = context.args
 
-    if data == "__DONE__":
-        if not selected_games:
-            await query.edit_message_text(text="⚠️ Du musst zuerst mindestens ein Spiel auswählen!")
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text="Wähle deine Spiele aus:",
-                reply_markup=build_multi_select_keyboard(selected_games),
-            )
-            return
-
-        # Übergang in Ranking-Modus
-        context.user_data["awaiting_ranking"] = True
-        selected_str = ", ".join(selected_games)
-        await query.edit_message_text(
-            text=(
-                f"Du hast ausgewählt: *{selected_str}*\n\n"
-                "Bitte ordne sie jetzt nach Präferenz.\n"
-                "Schreibe z.B.:\n"
-                "`1. Chess, 2. Hangman, 3. 2048`\n\n"
-                "Denke daran, *alle* ausgewählten Spiele einmalig aufzulisten."
-            ),
+    if not args or not args[0].isdigit():
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="Bitte gib eine gültige Seitenzahl an, z. B.: `/games 1`.",
             parse_mode="Markdown",
         )
         return
 
-    # Toggle ein einzelnes Spiel
-    if data in GAMES:
-        if data in selected_games:
-            selected_games.remove(data)
-        else:
-            selected_games.append(data)
-        context.user_data["selected_games"] = selected_games
-
-        # Speichern in Postgres
-        save_selected(chat_id, selected_games)
-
-        # Keyboard aktualisieren (Häkchen setzen/entfernen)
-        await query.edit_message_text(
-            text="Wähle deine Spiele aus:",
-            reply_markup=build_multi_select_keyboard(selected_games),
+    page_num = int(args[0])
+    if page_num < 1 or page_num > MAX_PAGE:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"Seite {page_num} existiert nicht. Wähle eine Zahl zwischen 1 und {MAX_PAGE}.",
         )
         return
 
-    # Fallback
-    await query.edit_message_text(text="❌ Da ist etwas schiefgelaufen. Bitte /start erneut.")
+    text = format_games_page(page_num)
+    await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
 
 
-async def handle_ranking_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Wenn context.user_data['awaiting_ranking'] True ist, parsen wir
-    eingehende Textnachrichten als finale Rangfolge, validieren und speichern.
+    Verarbeitet Textnachrichten:
+    - Jede gültige Kommaseparierte Liste von IDs wird direkt als Ranking interpretiert.
+    - Speichert selected_ids = ranking_ids und bestätigt die Auswahl.
     """
-    if not context.user_data.get("awaiting_ranking", False):
-        return
-
     chat_id = update.effective_chat.id
     text = update.message.text.strip()
-    selected_games: list[str] = context.user_data.get("selected_games", [])
 
-    # Splitting per Komma
-    parts = [p.strip() for p in text.split(",") if p.strip()]
+    # IDs extrahieren (Komma-getrennt, nur Ziffern)
+    parts = [p.strip() for p in text.split(",") if p.strip().isdigit()]
     if not parts:
         await context.bot.send_message(
             chat_id=chat_id,
-            text="⚠️ Ich erkenne keine Komma-Liste. Bitte formatiere so:\n`1. Chess, 2. Hangman, 3. 2048`",
-            parse_mode="Markdown",
+            text="Ich konnte keine gültigen IDs erkennen. Bitte sende etwas wie `1,5,10`.",
         )
         return
 
-    normalized: list[str] = []
-    for part in parts:
-        name = re.sub(r"^\s*\d+\.\s*", "", part)
-        normalized.append(name)
+    ids = [int(p) for p in parts]
+    # IDs validieren (müssen innerhalb 1..len(GAMES_DF) liegen)
+    for gid in ids:
+        if gid < 1 or gid > len(GAMES_DF):
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"Ungültige ID {gid}. Bitte wähle IDs zwischen 1 und {len(GAMES_DF)}."
+            )
+            return
 
-    if set(normalized) != set(selected_games) or len(normalized) != len(selected_games):
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=(
-                "⚠️ Deine Liste stimmt nicht genau mit den ausgewählten Spielen überein.\n"
-                f"Du hast ausgewählt: *{', '.join(selected_games)}*\n"
-                f"Du hast gerankt: *{', '.join(normalized)}*\n\n"
-                "Stelle sicher, dass:\n"
-                "  • Du alle ausgewählten Spiele exakt einmal nennst.\n"
-                "  • Kommas zwischen jedem Eintrag stehen.\n\n"
-                "Versuche es erneut:\n`1. Chess, 2. Hangman, 3. 2048`"
-            ),
-            parse_mode="Markdown",
-        )
-        return
+    # Speicherung: ausgewählte IDs und Ranking identisch
+    save_selected_and_ranking(chat_id, ids)
+    context.user_data["selected_ids"] = ids
+    context.user_data["ranking_ids"] = ids
 
-    # Ranking ist valide → in-memory und in Postgres speichern
-    context.user_data["ranking"] = normalized
-    context.user_data["awaiting_ranking"] = False
-
-    save_ranking(chat_id, normalized)
-
-    ranked_list_text = "\n".join(f"{i+1}. {game}" for i, game in enumerate(normalized))
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text="✅ Deine finale Rangfolge:\n\n" + ranked_list_text + "\n\nTippe /change, um neu zu starten.",
+    # Bestätigung mit Spielnamen
+    names = [
+        GAMES_DF.loc[GAMES_DF["game_id"] == gid, "game_name"].values[0]
+        for gid in ids
+    ]
+    text_resp = (
+        "✅ Deine Auswahl (in Prioritätsreihenfolge):\n"
+        + "\n".join(f"{i+1}. {names[i]}" for i in range(len(names)))
+        + "\n\n"
+        "Wenn du erneut eine andere Reihenfolge senden möchtest, schicke einfach erneut die IDs."
     )
-
-
-async def change(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    /change: Setzt die Auswahl in memory zurück. 
-    In der DB bleibt der alte Zustand unverändert, bis save_selected erneut aufgerufen wird.
-    """
-    chat_id = update.effective_chat.id
-    context.user_data["selected_games"] = []
-    context.user_data["ranking"] = []
-    context.user_data["awaiting_ranking"] = False
-
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text="🔄 Neu starten: Wähle deine Spiele per Klick aus.",
-    )
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text="Wähle deine Spiele aus:",
-        reply_markup=build_multi_select_keyboard([]),
-    )
+    await context.bot.send_message(chat_id=chat_id, text=text_resp)
 
 
 async def current(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    /current: Zeigt den aktuellen in-memory-Zustand (selected + ranking) an.
+    /current: Zeigt die aktuelle Reihenfolge (Ranking) an, sofern vorhanden.
     """
     chat_id = update.effective_chat.id
-    selected_games = context.user_data.get("selected_games", [])
-    ranking = context.user_data.get("ranking", [])
+    rank_ids = context.user_data.get("ranking_ids", [])
 
-    if not selected_games:
-        await context.bot.send_message(chat_id=chat_id, text="Du hast noch nichts ausgewählt. /start")
+    if not rank_ids:
+        await context.bot.send_message(chat_id=chat_id, text="Du hast noch keine Spiele ausgewählt.")
         return
 
-    if ranking:
-        ranked_list_text = "\n".join(f"{i+1}. {g}" for i, g in enumerate(ranking))
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text="🎮 Aktuelle Rangfolge:\n\n" + ranked_list_text + "\n\nTippe /change, um neu zu starten.",
-        )
-    else:
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=(
-                "Du hast ausgewählt, aber noch nicht gerankt:\n"
-                f"*{', '.join(selected_games)}*\n\n"
-                "Bitte ranke mit:\n`1. Chess, 2. Hangman, 3. 2048`"
-            ),
-            parse_mode="Markdown",
-        )
+    rank_names = [
+        GAMES_DF.loc[GAMES_DF["game_id"] == gid, "game_name"].values[0]
+        for gid in rank_ids
+    ]
+    text = (
+        "🎮 Deine aktuelle Prioritätenliste:\n"
+        + "\n".join(f"{i+1}. {rank_names[i]}" for i in range(len(rank_names)))
+        + "\n\n"
+        "Um sie zu ändern, sende einfach erneut deine ID-Liste."
+    )
+    await context.bot.send_message(chat_id=chat_id, text=text)
 
 
 # ── HAUPTBAUSTEIN: DB INITIALISIEREN & WEBHOOK STARTEN ────────────────────────────
 
 def main() -> None:
-    # 1) Postgres-Tabelle anlegen (falls fehlt)
+    # 1) Postgres-Tabelle anlegen (falls fehlt) und Spalten absichern
     init_db()
 
     # 2) Token und APP_URL aus Umgebung auslesen
@@ -376,10 +317,9 @@ def main() -> None:
 
     # 3) Handler registrieren
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(handle_selection_callback))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_ranking_message))
-    app.add_handler(CommandHandler("change", change))
+    app.add_handler(CommandHandler("games", list_games))
     app.add_handler(CommandHandler("current", current))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     # 4) Webhook-Pfad und -URL
     WEBHOOK_PATH = f"/{TOKEN}"
