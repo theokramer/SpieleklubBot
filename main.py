@@ -1,8 +1,9 @@
 import os
 import logging
 import re
-import sqlite3
 import json
+import psycopg2
+import psycopg2.extras
 
 from telegram import (
     Update,
@@ -24,23 +25,32 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ── DATENBANK: INITIALISIERUNG ───────────────────────────────────────────────────
-DB_PATH = "user_data.db"  # SQLite-Datei im selben Verzeichnis wie das Script
+# ── POSTGRES-DB: VERBINDUNG UND FUNKTIONEN ──────────────────────────────────────
+
+def get_db_connection():
+    """
+    Baut eine psycopg2-Verbindung zur Render-Postgres-DB 
+    anhand der Environment-Variable DATABASE_URL auf.
+    """
+    database_url = os.getenv("DATABASE_URL")
+    if not database_url:
+        raise RuntimeError("Environment-Variable DATABASE_URL ist nicht gesetzt")
+    conn = psycopg2.connect(dsn=database_url, cursor_factory=psycopg2.extras.DictCursor)
+    return conn
 
 def init_db() -> None:
     """
-    Erzeugt die Tabelle user_state, falls sie noch nicht existiert.
-    Spalten:
-      - chat_id  INTEGER PRIMARY KEY
-      - selected TEXT       → JSON-Array der ausgewählten Spiele
-      - ranking  TEXT       → JSON-Array der finalen Rangfolge
+    Legt in Postgres die Tabelle user_state an, falls sie noch nicht existiert:
+      - chat_id  BIGINT PRIMARY KEY
+      - selected TEXT       (JSON-Array)
+      - ranking  TEXT       (JSON-Array)
     """
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute(
         """
         CREATE TABLE IF NOT EXISTS user_state (
-            chat_id  INTEGER PRIMARY KEY,
+            chat_id  BIGINT PRIMARY KEY,
             selected TEXT,
             ranking  TEXT
         );
@@ -48,67 +58,57 @@ def init_db() -> None:
     )
     conn.commit()
     conn.close()
-    logger.info("Datenbank initialisiert: Tabelle user_state sicher existiert.")
-
+    logger.info("Postgres-Tabelle user_state ist nun vorhanden.")
 
 def save_selected(chat_id: int, selected_games: list[str]) -> None:
     """
-    Speichert oder aktualisiert die Spalte 'selected' für diesen chat_id.
-    Falls der Datensatz noch nicht existiert, wird er angelegt (mit ranking=NULL).
+    Speichert oder aktualisiert in Postgres die Spalte 'selected' für diesen chat_id.
+    (ranking bleibt unverändert, falls schon vorhanden.)
     """
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     cursor = conn.cursor()
     json_selected = json.dumps(selected_games, ensure_ascii=False)
 
-    # Prüfen, ob Eintrag bereits existiert
-    cursor.execute("SELECT 1 FROM user_state WHERE chat_id = ?", (chat_id,))
-    exists = cursor.fetchone() is not None
-
-    if exists:
-        cursor.execute(
-            "UPDATE user_state SET selected = ? WHERE chat_id = ?",
-            (json_selected, chat_id),
-        )
-    else:
-        cursor.execute(
-            "INSERT INTO user_state (chat_id, selected, ranking) VALUES (?, ?, NULL)",
-            (chat_id, json_selected),
-        )
+    cursor.execute(
+        """
+        INSERT INTO user_state (chat_id, selected, ranking)
+        VALUES (%s, %s, NULL)
+        ON CONFLICT (chat_id) DO UPDATE
+          SET selected = EXCLUDED.selected
+        """,
+        (chat_id, json_selected),
+    )
 
     conn.commit()
     conn.close()
-    logger.info(f"Gespeichert (selected) für chat_id={chat_id}: {selected_games}")
-
+    logger.info(f"[DB] Gespeichert (selected) für chat_id={chat_id}: {selected_games}")
 
 def save_ranking(chat_id: int, ranking: list[str]) -> None:
     """
-    Speichert oder aktualisiert die Spalte 'ranking' für diesen chat_id.
-    Wenn es noch keinen Datensatz gibt, wird er angelegt (selected=NULL).
+    Speichert oder aktualisiert in Postgres die Spalte 'ranking' für diesen chat_id.
+    (selected bleibt unverändert, falls schon existiert.)
     """
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     cursor = conn.cursor()
     json_ranking = json.dumps(ranking, ensure_ascii=False)
 
-    cursor.execute("SELECT 1 FROM user_state WHERE chat_id = ?", (chat_id,))
-    exists = cursor.fetchone() is not None
-
-    if exists:
-        cursor.execute(
-            "UPDATE user_state SET ranking = ? WHERE chat_id = ?",
-            (json_ranking, chat_id),
-        )
-    else:
-        cursor.execute(
-            "INSERT INTO user_state (chat_id, selected, ranking) VALUES (?, NULL, ?)",
-            (chat_id, json_ranking),
-        )
+    cursor.execute(
+        """
+        INSERT INTO user_state (chat_id, selected, ranking)
+        VALUES (%s, NULL, %s)
+        ON CONFLICT (chat_id) DO UPDATE
+          SET ranking = EXCLUDED.ranking
+        """,
+        (chat_id, json_ranking),
+    )
 
     conn.commit()
     conn.close()
-    logger.info(f"Gespeichert (ranking) für chat_id={chat_id}: {ranking}")
+    logger.info(f"[DB] Gespeichert (ranking) für chat_id={chat_id}: {ranking}")
 
 
-# ── KONSTANTEN ───────────────────────────────────────────────────────────────────
+# ── KONSTANTEN & HILFSFUNKTIONEN ─────────────────────────────────────────────────
+
 # Liste möglicher Spiele
 GAMES = ["Chess", "Tic-Tac-Toe", "Hangman", "2048", "Sudoku"]
 
@@ -125,19 +125,17 @@ def build_multi_select_keyboard(selected_games: list[str]) -> InlineKeyboardMark
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    /start: Daten im context.user_data zurücksetzen und leere DB-Zeile anlegen,
-    dann Keyboard senden.
+    /start: Reset in-memory state und lege in DB einen neuen Datensatz an (selected=[]).
     """
     chat_id = update.effective_chat.id
-    # context.user_data zurücksetzen
+    # In-memory state zurücksetzen:
     context.user_data.clear()
     context.user_data["selected_games"] = []
     context.user_data["awaiting_ranking"] = False
     context.user_data["ranking"] = []
 
-    # In der DB leeren Datensatz anlegen (falls noch nicht vorhanden)
+    # DB: Leeren Datensatz für selected anlegen (ranking bleibt NULL)
     save_selected(chat_id, [])
-    # Ranking bleibt in der DB NULL, bis der Nutzer eine finale Rangfolge sendet.
 
     await context.bot.send_message(
         chat_id=chat_id,
@@ -157,10 +155,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def handle_selection_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Wird ausgelöst, wenn ein Inline-Button getappt wird:
-    - data (Spielname) togglen und in context.user_data["selected_games"] aktualisieren
-    - In der DB speichern (save_selected)
-    - Wenn Done getappt wurde, zur Ranking-Eingabe auffordern
+    Inline-Button getappt: Toggle ein Spiel und speichere selected in Postgres.
+    Wenn Done getappt, Übergang in Ranking-Modus.
     """
     query = update.callback_query
     await query.answer()
@@ -170,7 +166,6 @@ async def handle_selection_callback(update: Update, context: ContextTypes.DEFAUL
 
     if data == "__DONE__":
         if not selected_games:
-            # Keine Auswahl getroffen → Fehlermeldung und Keyboard neu senden
             await query.edit_message_text(text="⚠️ Du musst zuerst mindestens ein Spiel auswählen!")
             await context.bot.send_message(
                 chat_id=chat_id,
@@ -179,7 +174,7 @@ async def handle_selection_callback(update: Update, context: ContextTypes.DEFAUL
             )
             return
 
-        # Auswahl abgeschlossen → Ranking-Modus starten
+        # Übergang in Ranking-Modus
         context.user_data["awaiting_ranking"] = True
         selected_str = ", ".join(selected_games)
         await query.edit_message_text(
@@ -194,7 +189,7 @@ async def handle_selection_callback(update: Update, context: ContextTypes.DEFAUL
         )
         return
 
-    # Ein einzelnes Spiel togglen
+    # Toggle ein einzelnes Spiel
     if data in GAMES:
         if data in selected_games:
             selected_games.remove(data)
@@ -202,25 +197,24 @@ async def handle_selection_callback(update: Update, context: ContextTypes.DEFAUL
             selected_games.append(data)
         context.user_data["selected_games"] = selected_games
 
-        # Sofort in der DB aktualisieren
+        # Speichern in Postgres
         save_selected(chat_id, selected_games)
 
-        # Keyboard-Nachricht so anpassen, dass die Häkchen korrekt angezeigt werden
+        # Keyboard aktualisieren (Häkchen setzen/entfernen)
         await query.edit_message_text(
             text="Wähle deine Spiele aus:",
             reply_markup=build_multi_select_keyboard(selected_games),
         )
         return
 
-    # Fallback, sollte nicht eintreten
+    # Fallback
     await query.edit_message_text(text="❌ Da ist etwas schiefgelaufen. Bitte /start erneut.")
 
 
 async def handle_ranking_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Wenn context.user_data["awaiting_ranking"] True ist,
-    interpretieren wir eingehende Text-Nachrichten als Ranking.
-    Validieren, speichern (DB + context.user_data) und bestätigen.
+    Wenn context.user_data['awaiting_ranking'] True ist, parsen wir
+    eingehende Textnachrichten als finale Rangfolge, validieren und speichern.
     """
     if not context.user_data.get("awaiting_ranking", False):
         return
@@ -229,7 +223,7 @@ async def handle_ranking_message(update: Update, context: ContextTypes.DEFAULT_T
     text = update.message.text.strip()
     selected_games: list[str] = context.user_data.get("selected_games", [])
 
-    # Teile den Text per Komma auf
+    # Splitting per Komma
     parts = [p.strip() for p in text.split(",") if p.strip()]
     if not parts:
         await context.bot.send_message(
@@ -239,13 +233,11 @@ async def handle_ranking_message(update: Update, context: ContextTypes.DEFAULT_T
         )
         return
 
-    # Entferne führende Nummerierung (z.B. "1. Chess" → "Chess")
     normalized: list[str] = []
     for part in parts:
-        name = re.sub(r"^\s*\d+\.\s*", "", part)  # entfernt "1.", "2.", etc.
+        name = re.sub(r"^\s*\d+\.\s*", "", part)
         normalized.append(name)
 
-    # Prüfen, ob normalized genau dieselben Spiele enthält wie selected_games
     if set(normalized) != set(selected_games) or len(normalized) != len(selected_games):
         await context.bot.send_message(
             chat_id=chat_id,
@@ -262,13 +254,12 @@ async def handle_ranking_message(update: Update, context: ContextTypes.DEFAULT_T
         )
         return
 
-    # Ranking ist valide → in context.user_data + DB speichern
+    # Ranking ist valide → in-memory und in Postgres speichern
     context.user_data["ranking"] = normalized
     context.user_data["awaiting_ranking"] = False
 
     save_ranking(chat_id, normalized)
 
-    # Bestätigung an den Nutzer
     ranked_list_text = "\n".join(f"{i+1}. {game}" for i, game in enumerate(normalized))
     await context.bot.send_message(
         chat_id=chat_id,
@@ -278,17 +269,13 @@ async def handle_ranking_message(update: Update, context: ContextTypes.DEFAULT_T
 
 async def change(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    /change: Setzt die Auswahl und das Ranking zurück,
-    löscht in context.user_data und DB nur selected, nicht aber gespeichertes Ranking.
+    /change: Setzt die Auswahl in memory zurück. 
+    In der DB bleibt der alte Zustand unverändert, bis save_selected erneut aufgerufen wird.
     """
     chat_id = update.effective_chat.id
-    # context zurücksetzen (aber in der DB belassen wir die alten Daten)
     context.user_data["selected_games"] = []
     context.user_data["ranking"] = []
     context.user_data["awaiting_ranking"] = False
-
-    # Für eine „echte“ Löschung aus der DB könntest du hier noch save_selected(chat_id, []) und/oder save_ranking(chat_id, []) aufrufen.
-    # Im Standardfall belassen wir das Ranking–Feld in der DB, bis der Nutzer neu rankt.
 
     await context.bot.send_message(
         chat_id=chat_id,
@@ -303,8 +290,7 @@ async def change(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def current(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    /current: Zeigt dem Nutzer den aktuellen Status (selected + ranking) aus context.user_data an.
-    (Optional: man könnte hier auch direkt aus der DB lesen.)
+    /current: Zeigt den aktuellen memory-Zustand (selected + ranking) an.
     """
     chat_id = update.effective_chat.id
     selected_games = context.user_data.get("selected_games", [])
@@ -332,12 +318,13 @@ async def current(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
 
-# ── HAUPTBAUSTEIN: APPLICATION ERZEUGEN, DB INIT & WEBHOOK STARTEN ───────────────────────
+# ── HAUPTBAUSTEIN: DB INITIALISIEREN & WEBHOOK STARTEN ────────────────────────────
+
 def main() -> None:
-    # 1) Datenbank initialisieren
+    # 1) Postgres-Tabelle anlegen (falls fehlt)
     init_db()
 
-    # 2) Bot-Konfiguration einlesen
+    # 2) Token und APP_URL aus Umgebung auslesen
     TOKEN = os.getenv("BOT_TOKEN")
     APP_URL = os.getenv("APP_URL")  # z.B. "https://mein-bot.onrender.com"
     if not TOKEN or not APP_URL:
@@ -353,7 +340,7 @@ def main() -> None:
     app.add_handler(CommandHandler("change", change))
     app.add_handler(CommandHandler("current", current))
 
-    # 4) Webhook-Pfad / -URL
+    # 4) Webhook-Pfad und -URL
     WEBHOOK_PATH = f"/{TOKEN}"
     WEBHOOK_URL = f"{APP_URL}/{TOKEN}"
 
