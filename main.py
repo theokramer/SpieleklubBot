@@ -225,8 +225,7 @@ def main() -> None:
     listen="0.0.0.0",
     port=int(os.environ.get("PORT", "8443")),
     url_path=WEBHOOK_PATH,      # ← hier muss es url_path heißen
-    webhook_url=WEBHOOK_URL,
-    on_startup=on_startup,      # optional, weil mit webhook_url der Webhook ohnehin gesetzt wird
+    webhook_url=WEBHOOK_URL,      # optional, weil mit webhook_url der Webhook ohnehin gesetzt wird
 )
 
 
