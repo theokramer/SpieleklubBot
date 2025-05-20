@@ -191,15 +191,40 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     save_profile(chat_id, first_name, last_name, username)
 
     text = (
-        f"👋 Willkommen, {first_name}!\n\n"
-        "Ich habe dein Profil gespeichert.\n"
-        "Um die Liste der Spiele anzusehen, nutze:\n"
-        "`/games <Seitenzahl>`\n"
-        "Beispiel: `/games 1` zeigt die ersten 10 Spiele.\n"
-        "Sende eine Kommaseparierte Liste von IDs, um direkt die Reihenfolge anzugeben.\n"
-        "Beispiel: `1,5,10` – ID 1 ist dein Favorit, dann ID 5, dann ID 10."
+    f"👋 Willkommen, {first_name}!\n\n"
+    "Ich habe dein Profil gespeichert.\n\n"
+    "📋 Befehle:\n"
+    "`/games <Seitenzahl>` – Zeigt eine Seite der Spieleliste\n"
+    "`/current` – Zeigt deine aktuelle Auswahl\n"
+    "`/delete` – Löscht deine aktuelle Auswahl\n\n"
+    "📨 Sende eine kommaseparierte Liste von IDs, um deine Favoriten anzugeben.\n"
+    "Beispiel: `1,5,10` – ID 1 ist dein Favorit, dann ID 5, dann ID 10."
     )
     await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
+
+async def delete_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /delete: Löscht die aktuelle Auswahl für den Benutzer.
+    """
+    chat_id = update.effective_chat.id
+
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+        UPDATE user_state
+        SET selected = NULL, ranking = NULL
+        WHERE chat_id = %s
+        """,
+        (chat_id,),
+    )
+    conn.commit()
+    conn.close()
+
+    context.user_data.pop("selected_ids", None)
+    context.user_data.pop("ranking_ids", None)
+
+    await context.bot.send_message(chat_id=chat_id, text="🗑️ Deine Auswahl wurde gelöscht.")
 
 
 async def list_games(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -279,6 +304,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def current(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     /current: Zeigt die aktuelle Reihenfolge (Ranking) an, sofern vorhanden.
+    Zum Löschen nutze /delete, zum Ändern sende neue IDs.
     """
     chat_id = update.effective_chat.id
     rank_ids = context.user_data.get("ranking_ids", [])
@@ -319,6 +345,7 @@ def main() -> None:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("games", list_games))
     app.add_handler(CommandHandler("current", current))
+    app.add_handler(CommandHandler("delete", delete_selection))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     # 4) Webhook-Pfad und -URL
