@@ -222,11 +222,13 @@ def main() -> None:
     # Starte den Webserver mit run_webhook()
     # Wir lauschen auf alle Interfaces (0.0.0.0) und PORT von Render
     app.run_webhook(
-        listen="0.0.0.0",
-        port=int(os.environ.get("PORT", "8443")),
-        webhook_path=WEBHOOK_PATH,
-        on_startup=on_startup,
+    listen="0.0.0.0",
+    port=int(os.environ.get("PORT", "8443")),
+    path=WEBHOOK_PATH,
+    webhook_url=WEBHOOK_URL,
+    on_startup=on_startup,     # optional, falls du Webhook noch explizit setzen willst
     )
+
 
 if __name__ == "__main__":
     main()
