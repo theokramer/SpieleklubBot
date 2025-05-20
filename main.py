@@ -142,7 +142,7 @@ def load_games_from_excel(path: str) -> pd.DataFrame:
     return df_clean
 
 # Excel-Datei beim Start laden (Pfad anpassen, falls nötig)
-GAMES_DF = load_games_from_excel("SpieleMitPreisen.xlsx")
+GAMES_DF = load_games_from_excel("SpieleMitPreisenIDs.xlsx")
 NUM_PER_PAGE = 10  # Anzahl Spiele pro Seite, kann angepasst werden
 MAX_PAGE = (len(GAMES_DF) - 1) // NUM_PER_PAGE + 1  # Gesamtzahl der Seiten
 
