@@ -224,10 +224,11 @@ def main() -> None:
     app.run_webhook(
     listen="0.0.0.0",
     port=int(os.environ.get("PORT", "8443")),
-    path=WEBHOOK_PATH,
+    url_path=WEBHOOK_PATH,      # ← hier muss es url_path heißen
     webhook_url=WEBHOOK_URL,
-    on_startup=on_startup,     # optional, falls du Webhook noch explizit setzen willst
-    )
+    on_startup=on_startup,      # optional, weil mit webhook_url der Webhook ohnehin gesetzt wird
+)
+
 
 
 if __name__ == "__main__":
