@@ -153,9 +153,9 @@ def format_games_page(page_num: int) -> str:
     Gibt einen Textblock zurück mit den Spielen und Preisen
     für die angegebene Seite (1-basiert).
     """
-    start_idx = (page_num - 1) * NUM_PER_PAGE
-    end_idx = start_idx + NUM_PER_PAGE
-    slice_df = GAMES_DF.iloc[start_idx:end_idx]
+    # start_idx = (page_num - 1) * NUM_PER_PAGE
+    # end_idx = start_idx + NUM_PER_PAGE
+    slice_df = GAMES_DF.iloc[0:MAX_PAGE]
 
     lines = [f"Seite {page_num}/{MAX_PAGE}:\n"]
     for _, row in slice_df.iterrows():
