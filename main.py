@@ -148,16 +148,14 @@ MAX_PAGE = (len(GAMES_DF) - 1) // NUM_PER_PAGE + 1  # Gesamtzahl der Seiten
 
 # ── HILFSFUNKTION: SPIELELISTE ALS TEXT ──────────────────────────────────────────
 
-def format_games_page(page_num: int) -> str:
+def format_games_page() -> str:
     """
     Gibt einen Textblock zurück mit den Spielen und Preisen
     für die angegebene Seite (1-basiert).
     """
-    # start_idx = (page_num - 1) * NUM_PER_PAGE
-    # end_idx = start_idx + NUM_PER_PAGE
     slice_df = GAMES_DF.iloc[0:MAX_PAGE*NUM_PER_PAGE]
 
-    lines = [f"Seite {page_num}/{MAX_PAGE}:\n"]
+    lines = [""]
     for _, row in slice_df.iterrows():
         gid = int(row["game_id"])
         name = row["game_name"]
@@ -194,7 +192,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     f"👋 Willkommen, {first_name}!\n\n"
     "Ich habe dein Profil gespeichert.\n\n"
     "📋 Befehle:\n"
-    "`/games <Seitenzahl>` – Zeigt eine Seite der Spieleliste\n"
+    "`/games` – Zeigt die Spieleliste\n"
     "`/current` – Zeigt deine aktuelle Auswahl\n"
     "`/delete` – Löscht deine aktuelle Auswahl\n\n"
     "📨 Sende eine kommaseparierte Liste von IDs, um deine Favoriten anzugeben.\n"
@@ -229,28 +227,11 @@ async def delete_selection(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 async def list_games(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    /games <Seitenzahl>: Zeigt die entsprechende Seite mit Spielen+Preisen.
+    /games: Zeigt die Spiele mit Preisen.
     """
     chat_id = update.effective_chat.id
-    args = context.args
 
-    if not args or not args[0].isdigit():
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text="Bitte gib eine gültige Seitenzahl an, z. B.: `/games 1`.",
-            parse_mode="Markdown",
-        )
-        return
-
-    page_num = int(args[0])
-    if page_num < 1 or page_num > MAX_PAGE:
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=f"Seite {page_num} existiert nicht. Wähle eine Zahl zwischen 1 und {MAX_PAGE}.",
-        )
-        return
-
-    text = format_games_page(page_num)
+    text = format_games_page()
     await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
 
 
