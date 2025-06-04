@@ -155,7 +155,7 @@ def format_games_page() -> str:
     """
     slice_df = GAMES_DF.iloc[0:MAX_PAGE*NUM_PER_PAGE]
 
-    lines = [""]
+    lines = ["Eine Liste aller Spiele inklusive Bildern gibt es auch hier: https://nextcloud.hpi.de/s/HRo3qcRexPCS3TS \n"]
     for _, row in slice_df.iterrows():
         gid = int(row["game_id"])
         name = row["game_name"]
